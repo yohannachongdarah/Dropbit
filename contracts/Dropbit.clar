@@ -27,6 +27,10 @@
 (define-constant ERR_ARBITRATION_NOT_FOUND (err u120))
 (define-constant ERR_ARBITRATION_COMPLETE (err u121))
 (define-constant ERR_MINIMUM_ARBITRATORS_NOT_MET (err u122))
+(define-constant ERR_INVALID_ZONE (err u123))
+(define-constant ERR_PRICING_NOT_FOUND (err u124))
+(define-constant ERR_INVALID_URGENCY_LEVEL (err u125))
+(define-constant ERR_SURGE_PRICING_ACTIVE (err u126))
 
 (define-data-var delivery-counter uint u0)
 (define-data-var platform-fee-rate uint u250)
@@ -135,11 +139,47 @@
   { arbitration-id: uint, arbitrator: principal }
   { vote: (string-ascii 20), weight: uint, timestamp: uint }
 )
+
+(define-map zone-demand
+  { zone-id: uint }
+  {
+    active-deliveries: uint,
+    completed-deliveries: uint,
+    available-couriers: uint,
+    demand-score: uint,
+    last-updated: uint
+  }
+)
+
+(define-map delivery-pricing
+  { delivery-id: uint }
+  {
+    base-price: uint,
+    distance-fee: uint,
+    urgency-fee: uint,
+    surge-fee: uint,
+    peak-hour-fee: uint,
+    total-price: uint,
+    urgency-level: (string-ascii 20)
+  }
+)
+
+(define-map hourly-demand
+  { hour: uint, zone-id: uint }
+  { delivery-count: uint, courier-count: uint, demand-ratio: uint }
+)
 (define-data-var arbitrator-counter uint u0)
 (define-data-var arbitration-counter uint u0)
 (define-data-var minimum-arbitrator-stake uint u1000000)
 (define-data-var voting-period-blocks uint u1008)
 (define-data-var minimum-arbitrators-required uint u3)
+(define-data-var base-delivery-price uint u100000)
+(define-data-var distance-rate uint u100)
+(define-data-var surge-multiplier uint u100)
+(define-data-var peak-hours-start uint u8)
+(define-data-var peak-hours-end uint u18)
+(define-data-var urgency-multiplier-express uint u150)
+(define-data-var urgency-multiplier-rush uint u200)
 
 (define-public (create-delivery 
   (recipient principal)
@@ -727,6 +767,163 @@
   )
 )
 
+(define-public (calculate-delivery-price 
+  (pickup-lat int)
+  (pickup-lng int)
+  (delivery-lat int)
+  (delivery-lng int)
+  (urgency-level (string-ascii 20)))
+  (let
+    (
+      (distance (to-uint (calculate-distance pickup-lat pickup-lng delivery-lat delivery-lng)))
+      (zone-id (calculate-zone-id delivery-lat delivery-lng))
+      (base-price (var-get base-delivery-price))
+      (distance-fee (* distance (var-get distance-rate)))
+      (urgency-fee (calculate-urgency-fee urgency-level))
+      (zone-demand-data (get-zone-demand-data zone-id))
+      (surge-fee (calculate-surge-fee zone-demand-data base-price))
+      (peak-hour-fee (calculate-peak-hour-fee))
+      (total-price (+ base-price distance-fee urgency-fee surge-fee peak-hour-fee))
+    )
+    (asserts! (is-valid-urgency-level urgency-level) ERR_INVALID_URGENCY_LEVEL)
+    (ok {
+      base-price: base-price,
+      distance-fee: distance-fee,
+      urgency-fee: urgency-fee,
+      surge-fee: surge-fee,
+      peak-hour-fee: peak-hour-fee,
+      total-price: total-price,
+      zone-id: zone-id
+    })
+  )
+)
+
+(define-public (create-delivery-with-pricing
+  (recipient principal)
+  (pickup-lat int)
+  (pickup-lng int)
+  (delivery-lat int)
+  (delivery-lng int)
+  (description (string-ascii 500))
+  (expires-in-blocks uint)
+  (urgency-level (string-ascii 20)))
+  (let
+    (
+      (delivery-id (+ (var-get delivery-counter) u1))
+      (pricing-result (unwrap! (calculate-delivery-price pickup-lat pickup-lng delivery-lat delivery-lng urgency-level) ERR_PRICING_NOT_FOUND))
+      (total-price (get total-price pricing-result))
+      (zone-id (get zone-id pricing-result))
+      (expires-at (+ stacks-block-height expires-in-blocks))
+    )
+    (asserts! (>= (stx-get-balance tx-sender) total-price) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (and (>= pickup-lat -90000000) (<= pickup-lat 90000000)) ERR_INVALID_COORDINATES)
+    (asserts! (and (>= pickup-lng -180000000) (<= pickup-lng 180000000)) ERR_INVALID_COORDINATES)
+    (asserts! (and (>= delivery-lat -90000000) (<= delivery-lat 90000000)) ERR_INVALID_COORDINATES)
+    (asserts! (and (>= delivery-lng -180000000) (<= delivery-lng 180000000)) ERR_INVALID_COORDINATES)
+    
+    (try! (stx-transfer? total-price tx-sender (as-contract tx-sender)))
+    
+    (map-set deliveries
+      { delivery-id: delivery-id }
+      {
+        sender: tx-sender,
+        recipient: recipient,
+        courier: none,
+        amount: total-price,
+        status: "pending",
+        created-at: stacks-block-height,
+        expires-at: expires-at,
+        pickup-lat: pickup-lat,
+        pickup-lng: pickup-lng,
+        delivery-lat: delivery-lat,
+        delivery-lng: delivery-lng,
+        actual-lat: none,
+        actual-lng: none,
+        description: description
+      }
+    )
+    
+    (map-set delivery-pricing
+      { delivery-id: delivery-id }
+      {
+        base-price: (get base-price pricing-result),
+        distance-fee: (get distance-fee pricing-result),
+        urgency-fee: (get urgency-fee pricing-result),
+        surge-fee: (get surge-fee pricing-result),
+        peak-hour-fee: (get peak-hour-fee pricing-result),
+        total-price: total-price,
+        urgency-level: urgency-level
+      }
+    )
+    
+    (unwrap-panic (update-zone-demand zone-id 1 0))
+    (var-set delivery-counter delivery-id)
+    (ok delivery-id)
+  )
+)
+
+(define-public (update-zone-demand (zone-id uint) (active-change int) (courier-change int))
+  (let
+    (
+      (current-demand (default-to 
+        { active-deliveries: u0, completed-deliveries: u0, available-couriers: u0, demand-score: u100, last-updated: u0 }
+        (map-get? zone-demand { zone-id: zone-id })
+      ))
+      (new-active (if (>= active-change 0) 
+        (+ (get active-deliveries current-demand) (to-uint active-change))
+        (if (>= (get active-deliveries current-demand) (to-uint (- 0 active-change)))
+          (- (get active-deliveries current-demand) (to-uint (- 0 active-change)))
+          u0
+        )
+      ))
+      (new-couriers (if (>= courier-change 0)
+        (+ (get available-couriers current-demand) (to-uint courier-change))
+        (if (>= (get available-couriers current-demand) (to-uint (- 0 courier-change)))
+          (- (get available-couriers current-demand) (to-uint (- 0 courier-change)))
+          u0
+        )
+      ))
+      (demand-score (calculate-demand-score new-active new-couriers))
+    )
+    (asserts! (< zone-id u100) ERR_INVALID_ZONE)
+    
+    (map-set zone-demand
+      { zone-id: zone-id }
+      (merge current-demand {
+        active-deliveries: new-active,
+        available-couriers: new-couriers,
+        demand-score: demand-score,
+        last-updated: stacks-block-height
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (register-courier-availability (zone-id uint))
+  (begin
+    (asserts! (< zone-id u100) ERR_INVALID_ZONE)
+    (update-zone-demand zone-id 0 1)
+  )
+)
+
+(define-public (update-pricing-parameters 
+  (new-base-price uint)
+  (new-distance-rate uint)
+  (new-surge-multiplier uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (> new-base-price u0) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (> new-distance-rate u0) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (<= new-surge-multiplier u500) ERR_INVALID_STATUS)
+    
+    (var-set base-delivery-price new-base-price)
+    (var-set distance-rate new-distance-rate)
+    (var-set surge-multiplier new-surge-multiplier)
+    (ok true)
+  )
+)
+
 (define-read-only (get-delivery (delivery-id uint))
   (map-get? deliveries { delivery-id: delivery-id })
 )
@@ -808,6 +1005,26 @@
 
 (define-read-only (get-minimum-arbitrators-required)
   (var-get minimum-arbitrators-required)
+)
+
+(define-read-only (get-delivery-pricing (delivery-id uint))
+  (map-get? delivery-pricing { delivery-id: delivery-id })
+)
+
+(define-read-only (get-zone-demand (zone-id uint))
+  (map-get? zone-demand { zone-id: zone-id })
+)
+
+(define-read-only (get-base-delivery-price)
+  (var-get base-delivery-price)
+)
+
+(define-read-only (get-current-surge-multiplier)
+  (var-get surge-multiplier)
+)
+
+(define-read-only (get-hourly-demand (hour uint) (zone-id uint))
+  (map-get? hourly-demand { hour: hour, zone-id: zone-id })
 )
 
 (define-private (calculate-distance (lat1 int) (lng1 int) (lat2 int) (lng2 int))
@@ -1054,3 +1271,90 @@
 (define-private (update-arbitrator-reputations (arbitration-id uint) (correct-outcome bool))
   (ok true)
 )
+
+(define-private (calculate-zone-id (lat int) (lng int))
+  (let
+    (
+      (lat-zone (/ (+ lat 90000000) 1800000))
+      (lng-zone (/ (+ lng 180000000) 3600000))
+    )
+    (+ (* (to-uint lat-zone) u100) (to-uint lng-zone))
+  )
+)
+
+(define-private (calculate-urgency-fee (urgency-level (string-ascii 20)))
+  (let
+    (
+      (base-price (var-get base-delivery-price))
+    )
+    (if (is-eq urgency-level "express")
+      (/ (* base-price (var-get urgency-multiplier-express)) u100)
+      (if (is-eq urgency-level "rush")
+        (/ (* base-price (var-get urgency-multiplier-rush)) u100)
+        u0
+      )
+    )
+  )
+)
+
+(define-private (is-valid-urgency-level (urgency-level (string-ascii 20)))
+  (or 
+    (is-eq urgency-level "standard")
+    (or 
+      (is-eq urgency-level "express")
+      (is-eq urgency-level "rush")
+    )
+  )
+)
+
+(define-private (get-zone-demand-data (zone-id uint))
+  (default-to 
+    { active-deliveries: u0, completed-deliveries: u0, available-couriers: u0, demand-score: u100, last-updated: u0 }
+    (map-get? zone-demand { zone-id: zone-id })
+  )
+)
+
+(define-private (calculate-surge-fee (zone-demand-data { active-deliveries: uint, completed-deliveries: uint, available-couriers: uint, demand-score: uint, last-updated: uint }) (base-price uint))
+  (let
+    (
+      (demand-score (get demand-score zone-demand-data))
+      (surge-rate (var-get surge-multiplier))
+    )
+    (if (> demand-score u150)
+      (/ (* base-price surge-rate) u100)
+      u0
+    )
+  )
+)
+
+(define-private (calculate-peak-hour-fee)
+  (let
+    (
+      (current-hour (mod stacks-block-height u24))
+      (peak-start (var-get peak-hours-start))
+      (peak-end (var-get peak-hours-end))
+      (base-price (var-get base-delivery-price))
+    )
+    (if (and (>= current-hour peak-start) (<= current-hour peak-end))
+      (/ (* base-price u20) u100)
+      u0
+    )
+  )
+)
+
+(define-private (calculate-demand-score (active-deliveries uint) (available-couriers uint))
+  (if (is-eq available-couriers u0)
+    u200
+    (let
+      (
+        (ratio (/ (* active-deliveries u100) available-couriers))
+      )
+      (if (> ratio u200) u200
+        (if (< ratio u50) u50 ratio)
+      )
+    )
+  )
+)
+
+
+
